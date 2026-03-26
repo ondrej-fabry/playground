@@ -1,0 +1,11 @@
+# .github/workflows/heavy.yml
+name: Heavy Reusable
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "real work here"
