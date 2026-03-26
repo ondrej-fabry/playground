@@ -1,40 +1,49 @@
-name: PR Gate
+name: PR Platform Gate
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
 
 jobs:
-  pr-gate:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [gen1, nextgen, legacy]
+
+    name: build / ${{ matrix.platform }}
+
+    permissions:
+      contents: read
+      actions: write
+
     steps:
       - uses: actions/checkout@v4
 
-      - id: decide
-        shell: bash
+      - name: Main platform work
         run: |
-          title='${{ github.event.pull_request.title }}'
-
-          if [[ "$title" == *"[heavy]"* ]]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "reason=PR title contains [heavy]" >> "$GITHUB_OUTPUT"
-          else
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "reason=PR title does not contain [heavy]" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Decision
-        run: |
-          echo "should_run=${{ steps.decide.outputs.should_run }}"
-          echo "reason=${{ steps.decide.outputs.reason }}"
-
-      - name: Heavy
-        if: steps.decide.outputs.should_run == 'true'
-        run: |
-          echo "running heavy path"
+          echo "platform=${{ matrix.platform }}"
           sleep 3
 
-      - name: Skip note
-        if: steps.decide.outputs.should_run != 'true'
+      - name: Dispatch async nextgen workflow
+        if: matrix.platform == 'nextgen'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_DISPATCH_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          echo "skipping heavy path"
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/$REPO/actions/workflows/nextgen-async.yml/dispatches \
+            -f ref="$REF" \
+            -f inputs[pr_number]="$PR_NUMBER" \
+            -f inputs[head_sha]="$HEAD_SHA" \
+            -f inputs[platform]="nextgen"
+
+      - name: Note async dispatch
+        if: matrix.platform == 'nextgen'
+        run: echo "Triggered async nextgen workflow."
