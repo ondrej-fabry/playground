@@ -1,0 +1,24 @@
+name: Nextgen Async
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      platform:
+        required: true
+        type: string
+
+jobs:
+  nextgen:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "PR=${{ inputs.pr_number }}"
+          echo "SHA=${{ inputs.head_sha }}"
+          echo "platform=${{ inputs.platform }}"
+          sleep 30
