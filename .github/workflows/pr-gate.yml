@@ -1,32 +1,40 @@
-# .github/workflows/pr-gate.yml
 name: PR Gate
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
-  decide:
+  pr-gate:
     runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.filter.outputs.should_run }}
     steps:
       - uses: actions/checkout@v4
 
-      - id: filter
+      - id: decide
+        shell: bash
         run: |
-          # put your logic here
-          # echo "should_run=true" >> "$GITHUB_OUTPUT"
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          title='${{ github.event.pull_request.title }}'
 
-  heavy:
-    needs: decide
-    if: needs.decide.outputs.should_run == 'true'
-    uses: ./.github/workflows/heavy.yml
+          if [[ "$title" == *"[heavy]"* ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=PR title contains [heavy]" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=PR title does not contain [heavy]" >> "$GITHUB_OUTPUT"
+          fi
 
-  noop:
-    needs: decide
-    if: needs.decide.outputs.should_run != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Nothing to do for this PR."
+      - name: Decision
+        run: |
+          echo "should_run=${{ steps.decide.outputs.should_run }}"
+          echo "reason=${{ steps.decide.outputs.reason }}"
+
+      - name: Heavy
+        if: steps.decide.outputs.should_run == 'true'
+        run: |
+          echo "running heavy path"
+          sleep 3
+
+      - name: Skip note
+        if: steps.decide.outputs.should_run != 'true'
+        run: |
+          echo "skipping heavy path"
