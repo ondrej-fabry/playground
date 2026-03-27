@@ -21,26 +21,16 @@ jobs:
   nextgen:
     runs-on: ubuntu-latest
     steps:
-      - name: Mark async job as pending
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Log inputs
         run: |
-          gh api \
-            -X POST \
-            repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
-            -f state='pending' \
-            -f context='nextgen-async' \
-            -f description='Nextgen async workflow started' \
-            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-      - name: Run async work
-        id: work
-        shell: bash
-        run: |
-          set -euo pipefail
           echo "PR=${{ inputs.pr_number }}"
           echo "SHA=${{ inputs.head_sha }}"
           echo "platform=${{ inputs.platform }}"
+
+      - name: Run async work
+        shell: bash
+        run: |
+          set -euo pipefail
           sleep 30
 
       - name: Mark async job as success
