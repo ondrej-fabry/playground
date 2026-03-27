@@ -13,12 +13,58 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+  statuses: write
+
 jobs:
   nextgen:
     runs-on: ubuntu-latest
     steps:
-      - run: |
+      - name: Mark async job as pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -X POST \
+            repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state='pending' \
+            -f context='nextgen-async' \
+            -f description='Nextgen async workflow started' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Run async work
+        id: work
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "PR=${{ inputs.pr_number }}"
           echo "SHA=${{ inputs.head_sha }}"
           echo "platform=${{ inputs.platform }}"
           sleep 30
+
+      - name: Mark async job as success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -X POST \
+            repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state='success' \
+            -f context='nextgen-async' \
+            -f description='Nextgen async workflow passed' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Mark async job as failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -X POST \
+            repos/${{ github.repository }}/statuses/${{ inputs.head_sha }} \
+            -f state='failure' \
+            -f context='nextgen-async' \
+            -f description='Nextgen async workflow failed' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
