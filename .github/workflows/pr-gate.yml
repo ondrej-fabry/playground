@@ -50,3 +50,17 @@ jobs:
       - name: Extra nextgen step
         if: matrix.platform == 'nextgen'
         run: echo "nextgen-only extra step"
+      
+      - name: Dispatch async nextgen workflow
+        if: matrix.platform == 'nextgen'
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_DISPATCH_TOKEN }}
+        run: |
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/actions/workflows/nextgen-async.yml/dispatches \
+            -f ref="${{ github.event.pull_request.head.ref }}" \
+            -f inputs[pr_number]="${{ github.event.pull_request.number }}" \
+            -f inputs[head_sha]="${{ github.event.pull_request.head.sha }}" \
+            -f inputs[platform]="nextgen"
