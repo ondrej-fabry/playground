@@ -1,4 +1,4 @@
-name: PR Matrix From Title
+name: PR Platform Gate
 
 on:
   pull_request:
@@ -15,24 +15,21 @@ jobs:
         run: |
           title='${{ github.event.pull_request.title }}'
 
-          platforms=()
+          jq -cn --arg title "$title" '
+            {
+              include:
+                (
+                  [
+                    (if $title | contains("[gen1]")    then {platform:"gen1"}    else empty end),
+                    (if $title | contains("[nextgen]") then {platform:"nextgen"} else empty end),
+                    (if $title | contains("[arm]")     then {platform:"arm"}     else empty end)
+                  ]
+                  | if length == 0 then [{platform:"gen1"}] else . end
+                )
+            }
+          ' | tee /tmp/matrix.json
 
-          [[ "$title" == *"[gen1]"*    ]] && platforms+=('"gen1"')
-          [[ "$title" == *"[nextgen]"* ]] && platforms+=('"nextgen"')
-          [[ "$title" == *"[arm]"*     ]] && platforms+=('"arm"')
-
-          # default when title has no markers
-          if [ ${#platforms[@]} -eq 0 ]; then
-            platforms+=('"gen1"')
-          fi
-
-          matrix_json=$(printf '{"include":[%s]}\n' \
-            "$(IFS=,; for p in "${platforms[@]}"; do
-                printf '{"platform":%s},' "$p"
-              done | sed 's/,$//')")
-
-          echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
-          echo "$matrix_json"
+          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
 
   build:
     needs: decide
@@ -41,16 +38,32 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.decide.outputs.matrix) }}
     name: build / ${{ matrix.platform }}
+
+    permissions:
+      contents: read
+      statuses: write
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Main
-        run: echo "platform=${{ matrix.platform }}"
+      - name: Main platform work
+        run: |
+          echo "platform=${{ matrix.platform }}"
+          sleep 3
 
-      - name: Extra nextgen step
+      - name: Mark nextgen async as pending
         if: matrix.platform == 'nextgen'
-        run: echo "nextgen-only extra step"
-      
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            -X POST \
+            repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -f state='pending' \
+            -f context='nextgen-async' \
+            -f description='Nextgen async workflow queued' \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
       - name: Dispatch async nextgen workflow
         if: matrix.platform == 'nextgen'
         env:
@@ -63,4 +76,4 @@ jobs:
             -f ref="${{ github.event.pull_request.head.ref }}" \
             -f inputs[pr_number]="${{ github.event.pull_request.number }}" \
             -f inputs[head_sha]="${{ github.event.pull_request.head.sha }}" \
-            -f inputs[platform]="nextgen"
+            -f inputs[platform]="${{ matrix.platform }}"
