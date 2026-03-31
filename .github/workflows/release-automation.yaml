@@ -1,0 +1,615 @@
+name: Release Automation
+
+on:
+  push:
+    tags:
+      - 'release/**'
+    branches:
+      - 'release/**'
+  create:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  draft-release:
+    name: Create draft release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag information
+        id: tag_info
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          TAG_COMMIT="$(git rev-list -n 1 "$TAG_NAME")"
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag_commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+
+          # Generic pattern:
+          # release/<component>/<major>.<minor>[...]
+          if [[ "$TAG_NAME" =~ ^release/([^/]+)/([0-9]+)\. ]]; then
+            COMPONENT="${BASH_REMATCH[1]}"
+            MAJOR="${BASH_REMATCH[2]}"
+            PREVIOUS_TAG_PATTERN="release/${COMPONENT}/${MAJOR}."
+          else
+            COMPONENT="unknown"
+            MAJOR="unknown"
+            PREVIOUS_TAG_PATTERN=""
+          fi
+
+          echo "component=$COMPONENT" >> "$GITHUB_OUTPUT"
+          echo "major_version=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "previous_tag_pattern=$PREVIOUS_TAG_PATTERN" >> "$GITHUB_OUTPUT"
+
+          BRANCH="$(
+            git for-each-ref --format='%(refname:short)' refs/remotes/origin/release/ |
+            while read -r ref; do
+              if git merge-base --is-ancestor "$TAG_COMMIT" "$ref"; then
+                echo "${ref#origin/}"
+                break
+              fi
+            done
+          )"
+
+          echo "branch=${BRANCH:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether tag is annotated
+        id: tag_kind
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ steps.tag_info.outputs.tag_name }}"
+
+          if [[ "$(git cat-file -t "$TAG_NAME")" == "tag" ]]; then
+            echo "is_annotated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_annotated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find previous release tag
+        id: previous_tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${{ steps.tag_info.outputs.tag_name }}"
+          PATTERN="${{ steps.tag_info.outputs.previous_tag_pattern }}"
+          BRANCH="${{ steps.tag_info.outputs.branch }}"
+
+          if [[ -z "$PATTERN" ]]; then
+            echo "previous_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$BRANCH" != "unknown" ]]; then
+            PREV_TAG="$(
+              git tag --merged "$BRANCH" --sort=-version:refname |
+              grep -E "^${PATTERN}" |
+              grep -Fxv "$TAG_NAME" |
+              head -n1 || true
+            )"
+          else
+            PREV_TAG="$(
+              git tag --sort=-version:refname |
+              grep -E "^${PATTERN}" |
+              grep -Fxv "$TAG_NAME" |
+              head -n1 || true
+            )"
+          fi
+
+          echo "previous_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${{ steps.tag_info.outputs.tag_name }}"
+          PREV_TAG="${{ steps.previous_tag.outputs.previous_tag }}"
+          IS_ANNOTATED="${{ steps.tag_kind.outputs.is_annotated }}"
+
+          NOTES_FILE="$(mktemp)"
+
+          {
+            echo "<!--"
+            echo "  Notes:"
+            echo "  - Fill in the release summary before publishing."
+            echo "  - Add PR references, issue links, or commit highlights as needed."
+            if [[ "$IS_ANNOTATED" != "true" ]]; then
+              echo
+              echo "  WARNING: this tag is lightweight, not annotated."
+              echo "  Recommended:"
+              echo "    git tag -a <tag> -m \"Release <tag>\""
+            fi
+            echo "-->"
+            echo
+            echo "## What's Changed"
+            echo "-"
+            if [[ -n "$PREV_TAG" ]]; then
+              echo
+              echo "## Compare"
+              echo "- Previous tag: \`$PREV_TAG\`"
+              echo "- Current tag: \`$TAG_NAME\`"
+            fi
+          } > "$NOTES_FILE"
+
+          {
+            echo 'notes<<EOF'
+            cat "$NOTES_FILE"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        id: create_release
+        uses: actions/github-script@v7
+        env:
+          TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
+          BRANCH: ${{ steps.tag_info.outputs.branch }}
+          RELEASE_NOTES: ${{ steps.release_notes.outputs.notes }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tagName = process.env.TAG_NAME;
+            const branch = process.env.BRANCH;
+            const body = process.env.RELEASE_NOTES;
+
+            try {
+              const response = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tagName,
+                name: tagName,
+                body,
+                draft: true,
+                prerelease: false,
+                target_commitish: branch !== 'unknown' ? branch : undefined
+              });
+
+              core.setOutput('success', 'true');
+              core.setOutput('release_id', String(response.data.id));
+              core.setOutput('release_url', response.data.html_url);
+            } catch (error) {
+              core.setOutput('success', 'false');
+              core.setOutput('error', error.message);
+              throw error;
+            }
+
+      - name: Notify Slack about draft release
+        id: slack_draft
+        if: always() && steps.create_release.outcome != 'skipped'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
+          TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
+          COMPONENT: ${{ steps.tag_info.outputs.component }}
+          RELEASE_URL: ${{ steps.create_release.outputs.release_url }}
+          SUCCESS: ${{ steps.create_release.outputs.success }}
+          IS_ANNOTATED: ${{ steps.tag_kind.outputs.is_annotated }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "slack_notified=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANNEL="${SLACK_CHANNEL:-#releases}"
+
+          if [[ "$SUCCESS" == "true" ]]; then
+            ICON=":memo:"
+            STATUS="Draft release created"
+          else
+            ICON=":warning:"
+            STATUS="Failed to create draft release"
+          fi
+
+          if [[ "$IS_ANNOTATED" != "true" ]]; then
+            ICON=":warning: :memo:"
+          fi
+
+          PAYLOAD="$(cat <<EOF
+          {
+            "channel": "$CHANNEL",
+            "username": "Release Bot",
+            "icon_emoji": ":rocket:",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "$ICON *$STATUS*\\n*Tag:* \`$TAG_NAME\`\\n*Component:* \`${COMPONENT^^}\`"
+                }
+              }
+            ]
+          }
+          EOF
+          )"
+
+          if [[ -n "${RELEASE_URL:-}" ]]; then
+            PAYLOAD="$(python3 - <<'PY'
+import json, os
+payload = json.loads(os.environ["PAYLOAD"])
+payload["blocks"].append({
+  "type": "actions",
+  "elements": [{
+    "type": "button",
+    "text": {"type": "plain_text", "text": "View Draft Release"},
+    "url": os.environ["RELEASE_URL"]
+  }]
+})
+print(json.dumps(payload))
+PY
+)"
+          fi
+
+          HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
+            -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")"
+
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "slack_notified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "slack_notified=false" >> "$GITHUB_OUTPUT"
+            cat /tmp/slack-response.txt
+            exit 1
+          fi
+        env:
+          PAYLOAD: ""
+
+      - name: Update job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# Draft Release Summary"
+            echo
+            echo "## Tag"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`${{ steps.tag_info.outputs.tag_name }}\` |"
+            echo "| Component | \`${{ steps.tag_info.outputs.component }}\` |"
+            echo "| Major | \`${{ steps.tag_info.outputs.major_version }}\` |"
+            echo "| Branch | \`${{ steps.tag_info.outputs.branch }}\` |"
+            echo "| Annotated | \`${{ steps.tag_kind.outputs.is_annotated }}\` |"
+            echo
+            echo "## Previous Tag"
+            if [[ -n "${{ steps.previous_tag.outputs.previous_tag }}" ]]; then
+              echo "- \`${{ steps.previous_tag.outputs.previous_tag }}\`"
+            else
+              echo "- none found"
+            fi
+            echo
+            echo "## Release"
+            if [[ "${{ steps.create_release.outputs.success }}" == "true" ]]; then
+              echo "- status: created"
+              echo "- url: ${{ steps.create_release.outputs.release_url }}"
+            else
+              echo "- status: failed"
+              if [[ -n "${{ steps.create_release.outputs.error }}" ]]; then
+                echo "- error: \`${{ steps.create_release.outputs.error }}\`"
+              fi
+            fi
+            echo
+            echo "## Slack"
+            if [[ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]]; then
+              echo "- skipped: no webhook configured"
+            else
+              echo "- result: \`${{ steps.slack_draft.outputs.slack_notified || 'unknown' }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify_release_published:
+    name: Notify published release
+    if: github.event_name == 'release' && github.event.action == 'published' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract release information
+        id: release_info
+        shell: bash
+        env:
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          AUTHOR: ${{ github.event.release.author.login }}
+        run: |
+          set -euo pipefail
+
+          echo "name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
+
+          if [[ "$RELEASE_TAG" =~ ^release/([^/]+)/ ]]; then
+            echo "component=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "component=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack about published release
+        id: slack_release
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
+          RELEASE_NAME: ${{ steps.release_info.outputs.name }}
+          RELEASE_TAG: ${{ steps.release_info.outputs.tag }}
+          RELEASE_URL: ${{ steps.release_info.outputs.url }}
+          COMPONENT: ${{ steps.release_info.outputs.component }}
+          IS_PRERELEASE: ${{ steps.release_info.outputs.prerelease }}
+          AUTHOR: ${{ steps.release_info.outputs.author }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "slack_notified=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANNEL="${SLACK_CHANNEL:-#releases}"
+
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            ICON=":package:"
+            KIND="Pre-release"
+          else
+            ICON=":rocket:"
+            KIND="Release"
+          fi
+
+          PAYLOAD="$(cat <<EOF
+          {
+            "channel": "$CHANNEL",
+            "username": "Release Bot",
+            "icon_emoji": ":rocket:",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "$ICON *$KIND Published*\\n*Name:* $RELEASE_NAME\\n*Tag:* \`$RELEASE_TAG\`\\n*Component:* \`${COMPONENT^^}\`\\n*Published by:* @$AUTHOR"
+                }
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View Release"
+                    },
+                    "url": "$RELEASE_URL",
+                    "style": "primary"
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          )"
+
+          HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
+            -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")"
+
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "slack_notified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "slack_notified=false" >> "$GITHUB_OUTPUT"
+            cat /tmp/slack-response.txt
+            exit 1
+          fi
+
+      - name: Update job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# Published Release Notification"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Name | ${{ steps.release_info.outputs.name }} |"
+            echo "| Tag | \`${{ steps.release_info.outputs.tag }}\` |"
+            echo "| Component | \`${{ steps.release_info.outputs.component }}\` |"
+            echo "| Type | \`${{ steps.release_info.outputs.prerelease }}\` |"
+            echo "| Author | @${{ steps.release_info.outputs.author }} |"
+            echo
+            echo "- url: ${{ steps.release_info.outputs.url }}"
+            echo "- slack: \`${{ steps.slack_release.outputs.slack_notified || 'unknown' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  monitor_release_branches:
+    name: Monitor release branch activity
+    if: |
+      github.event_name == 'create' ||
+      (github.event_name == 'push' &&
+       startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect event
+        id: detect_event
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "create" ]]; then
+            if [[ "${{ github.event.ref_type }}" != "branch" ]]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "${{ github.event.ref }}" != release/* ]]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "event_type=branch_created" >> "$GITHUB_OUTPUT"
+            echo "branch=${{ github.event.ref }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event.forced }}" == "true" ]]; then
+            echo "event_type=force_push" >> "$GITHUB_OUTPUT"
+          else
+            echo "event_type=push" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.detect_event.outputs.skip != 'true' && github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get commit information
+        id: commit_info
+        if: steps.detect_event.outputs.skip != 'true' && github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_AUTHOR="$(git log -1 --pretty=%an "$COMMIT_SHA")"
+          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/$COMMIT_SHA"
+
+          echo "sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "author=$COMMIT_AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "url=$COMMIT_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack about branch activity
+        id: slack_branch
+        if: steps.detect_event.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
+          EVENT_TYPE: ${{ steps.detect_event.outputs.event_type }}
+          BRANCH: ${{ steps.detect_event.outputs.branch }}
+          COMMIT_SHA: ${{ steps.commit_info.outputs.sha }}
+          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
+          COMMIT_URL: ${{ steps.commit_info.outputs.url }}
+          ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "slack_notified=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANNEL="${SLACK_CHANNEL:-#releases}"
+
+          case "$EVENT_TYPE" in
+            branch_created)
+              ICON=":seedling:"
+              TITLE="Release branch created"
+              BODY="Branch \`$BRANCH\` was created by @$ACTOR"
+              ;;
+            force_push)
+              ICON=":warning:"
+              TITLE="Force push to release branch"
+              BODY=":warning: \`$BRANCH\` was force-pushed by @$ACTOR"
+              ;;
+            push)
+              ICON=":pushpin:"
+              TITLE="Push to release branch"
+              BODY="Branch \`$BRANCH\` received a push from @$ACTOR"
+              ;;
+            *)
+              echo "slack_notified=skipped" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          PAYLOAD="$(cat <<EOF
+          {
+            "channel": "$CHANNEL",
+            "username": "Release Bot",
+            "icon_emoji": ":branch:",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "$ICON *$TITLE*\\n$BODY"
+                }
+              }
+            ]
+          }
+          EOF
+          )"
+
+          if [[ -n "${COMMIT_URL:-}" ]]; then
+            PAYLOAD="$(python3 - <<'PY'
+import json, os
+payload = json.loads(os.environ["PAYLOAD"])
+payload["blocks"].append({
+  "type": "section",
+  "text": {
+    "type": "mrkdwn",
+    "text": f"*Commit:* <{os.environ['COMMIT_URL']}|`{os.environ['COMMIT_SHA'][:8]}`> by {os.environ['COMMIT_AUTHOR']}"
+  }
+})
+print(json.dumps(payload))
+PY
+)"
+          fi
+
+          HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
+            -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")"
+
+          if [[ "$HTTP_CODE" =~ ^2 ]]; then
+            echo "slack_notified=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "slack_notified=false" >> "$GITHUB_OUTPUT"
+            cat /tmp/slack-response.txt
+            exit 1
+          fi
+        env:
+          PAYLOAD: ""
+
+      - name: Update job summary
+        if: always() && steps.detect_event.outputs.skip != 'true'
+        shell: bash
+        run: |
+          {
+            echo "# Release Branch Activity"
+            echo
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Event | \`${{ steps.detect_event.outputs.event_type }}\` |"
+            echo "| Branch | \`${{ steps.detect_event.outputs.branch }}\` |"
+            echo "| Actor | @${{ github.actor }} |"
+            if [[ -n "${{ steps.commit_info.outputs.sha }}" ]]; then
+              echo "| Commit | \`${{ steps.commit_info.outputs.sha }}\` |"
+              echo "| Author | ${{ steps.commit_info.outputs.author }} |"
+            fi
+            echo
+            echo "- slack: \`${{ steps.slack_branch.outputs.slack_notified || 'unknown' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
