@@ -37,8 +37,6 @@ jobs:
           echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "tag_commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
 
-          # Generic pattern:
-          # release/<component>/<major>.<minor>[...]
           if [[ "$TAG_NAME" =~ ^release/([^/]+)/([0-9]+)\. ]]; then
             COMPONENT="${BASH_REMATCH[1]}"
             MAJOR="${BASH_REMATCH[2]}"
@@ -241,20 +239,21 @@ jobs:
           )"
 
           if [[ -n "${RELEASE_URL:-}" ]]; then
+            export PAYLOAD RELEASE_URL
             PAYLOAD="$(python3 - <<'PY'
-import json, os
-payload = json.loads(os.environ["PAYLOAD"])
-payload["blocks"].append({
-  "type": "actions",
-  "elements": [{
-    "type": "button",
-    "text": {"type": "plain_text", "text": "View Draft Release"},
-    "url": os.environ["RELEASE_URL"]
-  }]
-})
-print(json.dumps(payload))
-PY
-)"
+          import json, os
+          payload = json.loads(os.environ["PAYLOAD"])
+          payload["blocks"].append({
+            "type": "actions",
+            "elements": [{
+              "type": "button",
+              "text": {"type": "plain_text", "text": "View Draft Release"},
+              "url": os.environ["RELEASE_URL"]
+            }]
+          })
+          print(json.dumps(payload))
+          PY
+            )"
           fi
 
           HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
@@ -269,12 +268,22 @@ PY
             cat /tmp/slack-response.txt
             exit 1
           fi
-        env:
-          PAYLOAD: ""
 
       - name: Update job summary
         if: always()
         shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
+          COMPONENT: ${{ steps.tag_info.outputs.component }}
+          MAJOR_VERSION: ${{ steps.tag_info.outputs.major_version }}
+          BRANCH: ${{ steps.tag_info.outputs.branch }}
+          IS_ANNOTATED: ${{ steps.tag_kind.outputs.is_annotated }}
+          PREVIOUS_TAG: ${{ steps.previous_tag.outputs.previous_tag }}
+          RELEASE_SUCCESS: ${{ steps.create_release.outputs.success }}
+          RELEASE_URL: ${{ steps.create_release.outputs.release_url }}
+          RELEASE_ERROR: ${{ steps.create_release.outputs.error }}
+          SLACK_RESULT: ${{ steps.slack_draft.outputs.slack_notified }}
+          HAS_SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         run: |
           {
             echo "# Draft Release Summary"
@@ -282,35 +291,35 @@ PY
             echo "## Tag"
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Tag | \`${{ steps.tag_info.outputs.tag_name }}\` |"
-            echo "| Component | \`${{ steps.tag_info.outputs.component }}\` |"
-            echo "| Major | \`${{ steps.tag_info.outputs.major_version }}\` |"
-            echo "| Branch | \`${{ steps.tag_info.outputs.branch }}\` |"
-            echo "| Annotated | \`${{ steps.tag_kind.outputs.is_annotated }}\` |"
+            echo "| Tag | \`$TAG_NAME\` |"
+            echo "| Component | \`$COMPONENT\` |"
+            echo "| Major | \`$MAJOR_VERSION\` |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Annotated | \`$IS_ANNOTATED\` |"
             echo
             echo "## Previous Tag"
-            if [[ -n "${{ steps.previous_tag.outputs.previous_tag }}" ]]; then
-              echo "- \`${{ steps.previous_tag.outputs.previous_tag }}\`"
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              echo "- \`$PREVIOUS_TAG\`"
             else
               echo "- none found"
             fi
             echo
             echo "## Release"
-            if [[ "${{ steps.create_release.outputs.success }}" == "true" ]]; then
+            if [[ "$RELEASE_SUCCESS" == "true" ]]; then
               echo "- status: created"
-              echo "- url: ${{ steps.create_release.outputs.release_url }}"
+              echo "- url: $RELEASE_URL"
             else
               echo "- status: failed"
-              if [[ -n "${{ steps.create_release.outputs.error }}" ]]; then
-                echo "- error: \`${{ steps.create_release.outputs.error }}\`"
+              if [[ -n "$RELEASE_ERROR" ]]; then
+                echo "- error: \`$RELEASE_ERROR\`"
               fi
             fi
             echo
             echo "## Slack"
-            if [[ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]]; then
+            if [[ "$HAS_SLACK_WEBHOOK" != "true" ]]; then
               echo "- skipped: no webhook configured"
             else
-              echo "- result: \`${{ steps.slack_draft.outputs.slack_notified || 'unknown' }}\`"
+              echo "- result: \`${SLACK_RESULT:-unknown}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -422,20 +431,28 @@ PY
       - name: Update job summary
         if: always()
         shell: bash
+        env:
+          RELEASE_NAME: ${{ steps.release_info.outputs.name }}
+          RELEASE_TAG: ${{ steps.release_info.outputs.tag }}
+          COMPONENT: ${{ steps.release_info.outputs.component }}
+          IS_PRERELEASE: ${{ steps.release_info.outputs.prerelease }}
+          AUTHOR: ${{ steps.release_info.outputs.author }}
+          RELEASE_URL: ${{ steps.release_info.outputs.url }}
+          SLACK_RESULT: ${{ steps.slack_release.outputs.slack_notified }}
         run: |
           {
             echo "# Published Release Notification"
             echo
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Name | ${{ steps.release_info.outputs.name }} |"
-            echo "| Tag | \`${{ steps.release_info.outputs.tag }}\` |"
-            echo "| Component | \`${{ steps.release_info.outputs.component }}\` |"
-            echo "| Type | \`${{ steps.release_info.outputs.prerelease }}\` |"
-            echo "| Author | @${{ steps.release_info.outputs.author }} |"
+            echo "| Name | $RELEASE_NAME |"
+            echo "| Tag | \`$RELEASE_TAG\` |"
+            echo "| Component | \`$COMPONENT\` |"
+            echo "| Type | \`$IS_PRERELEASE\` |"
+            echo "| Author | @$AUTHOR |"
             echo
-            echo "- url: ${{ steps.release_info.outputs.url }}"
-            echo "- slack: \`${{ steps.slack_release.outputs.slack_notified || 'unknown' }}\`"
+            echo "- url: $RELEASE_URL"
+            echo "- slack: \`${SLACK_RESULT:-unknown}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   monitor_release_branches:
@@ -564,19 +581,20 @@ PY
           )"
 
           if [[ -n "${COMMIT_URL:-}" ]]; then
+            export PAYLOAD COMMIT_URL COMMIT_SHA COMMIT_AUTHOR
             PAYLOAD="$(python3 - <<'PY'
-import json, os
-payload = json.loads(os.environ["PAYLOAD"])
-payload["blocks"].append({
-  "type": "section",
-  "text": {
-    "type": "mrkdwn",
-    "text": f"*Commit:* <{os.environ['COMMIT_URL']}|`{os.environ['COMMIT_SHA'][:8]}`> by {os.environ['COMMIT_AUTHOR']}"
-  }
-})
-print(json.dumps(payload))
-PY
-)"
+          import json, os
+          payload = json.loads(os.environ["PAYLOAD"])
+          payload["blocks"].append({
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": f"*Commit:* <{os.environ['COMMIT_URL']}|`{os.environ['COMMIT_SHA'][:8]}`> by {os.environ['COMMIT_AUTHOR']}"
+            }
+          })
+          print(json.dumps(payload))
+          PY
+            )"
           fi
 
           HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
@@ -591,25 +609,30 @@ PY
             cat /tmp/slack-response.txt
             exit 1
           fi
-        env:
-          PAYLOAD: ""
 
       - name: Update job summary
         if: always() && steps.detect_event.outputs.skip != 'true'
         shell: bash
+        env:
+          EVENT_TYPE: ${{ steps.detect_event.outputs.event_type }}
+          BRANCH: ${{ steps.detect_event.outputs.branch }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_SHA: ${{ steps.commit_info.outputs.sha }}
+          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
+          SLACK_RESULT: ${{ steps.slack_branch.outputs.slack_notified }}
         run: |
           {
             echo "# Release Branch Activity"
             echo
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Event | \`${{ steps.detect_event.outputs.event_type }}\` |"
-            echo "| Branch | \`${{ steps.detect_event.outputs.branch }}\` |"
-            echo "| Actor | @${{ github.actor }} |"
-            if [[ -n "${{ steps.commit_info.outputs.sha }}" ]]; then
-              echo "| Commit | \`${{ steps.commit_info.outputs.sha }}\` |"
-              echo "| Author | ${{ steps.commit_info.outputs.author }} |"
+            echo "| Event | \`$EVENT_TYPE\` |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Actor | @$ACTOR |"
+            if [[ -n "$COMMIT_SHA" ]]; then
+              echo "| Commit | \`$COMMIT_SHA\` |"
+              echo "| Author | $COMMIT_AUTHOR |"
             fi
             echo
-            echo "- slack: \`${{ steps.slack_branch.outputs.slack_notified || 'unknown' }}\`"
+            echo "- slack: \`${SLACK_RESULT:-unknown}\`"
           } >> "$GITHUB_STEP_SUMMARY"
