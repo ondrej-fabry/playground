@@ -254,7 +254,6 @@ jobs:
           tag_url = os.environ["TAG_URL"]
           branch = os.environ["BRANCH"]
           branch_url = os.environ.get("BRANCH_URL", "")
-          component = os.environ["COMPONENT"]
           previous_tag = os.environ.get("PREVIOUS_TAG", "")
           previous_tag_url = os.environ.get("PREVIOUS_TAG_URL", "")
           release_url = os.environ.get("RELEASE_URL", "")
@@ -264,15 +263,21 @@ jobs:
           actor_url = os.environ.get("ACTOR_URL", "")
           actor_email = os.environ.get("ACTOR_EMAIL", "")
 
-          if success == "true":
-              icon = ":memo:"
-              title = "Draft release created"
+          parts = tag_name.split("/")
+          if len(parts) >= 3 and parts[0] == "release":
+              release_key = parts[-2].upper()
+              release_version = parts[-1]
+              release_label = f"{release_key} {release_version}"
           else:
-              icon = ":warning:"
-              title = "Failed to create draft release"
+              release_label = tag_name
+
+          if success == "true":
+              draft_state = ":white_check_mark: Draft release created"
+          else:
+              draft_state = ":warning: Draft release failed"
 
           if is_annotated != "true":
-              title = f"{title} · lightweight tag"
+              draft_state = f"{draft_state} (lightweight tag)"
 
           fields = [
               {
@@ -281,7 +286,7 @@ jobs:
               },
               {
                   "type": "mrkdwn",
-                  "text": f"*Component:*\n`{component.upper()}`"
+                  "text": f"*Release version:*\n`{release_label}`"
               }
           ]
 
@@ -306,12 +311,19 @@ jobs:
                   "type": "section",
                   "text": {
                       "type": "mrkdwn",
-                      "text": f"{icon} *{title}*"
+                      "text": f":label: *Tag pushed: {release_label}*"
                   }
               },
               {
                   "type": "section",
                   "fields": fields
+              },
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f"*GitHub draft release:* {draft_state}"
+                  }
               },
               {
                   "type": "context",
@@ -851,15 +863,23 @@ jobs:
           commit_lines = os.environ.get("COMMIT_LINES", "").strip()
           commit_count = os.environ.get("COMMIT_COUNT", "").strip()
 
+          parts = branch.split("/")
+          if len(parts) >= 3 and parts[0] == "release":
+              release_key = parts[-2].upper()
+              release_version = parts[-1]
+              release_label = f"{release_key} {release_version}"
+          else:
+              release_label = branch
+
           if event_type == "branch_created":
               icon = ":seedling:"
-              title = "Release branch created"
+              title = f"Release branch created: {release_label}"
           elif event_type == "force_push":
               icon = ":warning:"
-              title = "Force push to release branch"
+              title = f"Force push to release branch: {release_label}"
           else:
               icon = ":pushpin:"
-              title = "Push to release branch"
+              title = f"Push to release branch: {release_label}"
 
           context_text = f"<{actor_url}|@{actor_login}>"
           if actor_email:
@@ -879,6 +899,10 @@ jobs:
                       {
                           "type": "mrkdwn",
                           "text": f"*Branch:*\n<{branch_url}|`{branch}`>"
+                      },
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Release:*\n`{release_label}`"
                       }
                   ]
               },
