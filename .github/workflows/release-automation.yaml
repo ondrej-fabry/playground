@@ -33,9 +33,11 @@ jobs:
 
           TAG_NAME="${GITHUB_REF#refs/tags/}"
           TAG_COMMIT="$(git rev-list -n 1 "$TAG_NAME")"
+          TAG_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG_NAME}"
 
           echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "tag_commit=$TAG_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "tag_url=$TAG_URL" >> "$GITHUB_OUTPUT"
 
           if [[ "$TAG_NAME" =~ ^release/([^/]+)/([0-9]+)\. ]]; then
             COMPONENT="${BASH_REMATCH[1]}"
@@ -61,7 +63,37 @@ jobs:
             done
           )"
 
-          echo "branch=${BRANCH:-unknown}" >> "$GITHUB_OUTPUT"
+          BRANCH="${BRANCH:-unknown}"
+          if [[ "$BRANCH" != "unknown" ]]; then
+            BRANCH_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${BRANCH}"
+          else
+            BRANCH_URL=""
+          fi
+
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "branch_url=$BRANCH_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve actor info
+        id: actor_info
+        uses: actions/github-script@v7
+        env:
+          LOGIN: ${{ github.actor }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const login = process.env.LOGIN;
+            let email = '';
+            let url = `${context.serverUrl}/${login}`;
+
+            try {
+              const { data } = await github.rest.users.getByUsername({ username: login });
+              url = data.html_url || url;
+              email = data.email || '';
+            } catch (_) {}
+
+            core.setOutput('login', login);
+            core.setOutput('url', url);
+            core.setOutput('email', email);
 
       - name: Check whether tag is annotated
         id: tag_kind
@@ -70,7 +102,8 @@ jobs:
           set -euo pipefail
           TAG_NAME="${{ steps.tag_info.outputs.tag_name }}"
 
-          if [[ "$(git cat-file -t "$TAG_NAME")" == "tag" ]]; then
+          # `^{tag}` resolves only if the ref points to a tag object (annotated/signed tag).
+          if git rev-parse --verify --quiet "refs/tags/${TAG_NAME}^{tag}" >/dev/null; then
             echo "is_annotated=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_annotated=false" >> "$GITHUB_OUTPUT"
@@ -88,6 +121,7 @@ jobs:
 
           if [[ -z "$PATTERN" ]]; then
             echo "previous_tag=" >> "$GITHUB_OUTPUT"
+            echo "previous_tag_url=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -107,7 +141,13 @@ jobs:
             )"
           fi
 
+          PREV_TAG_URL=""
+          if [[ -n "$PREV_TAG" ]]; then
+            PREV_TAG_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${PREV_TAG}"
+          fi
+
           echo "previous_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "previous_tag_url=$PREV_TAG_URL" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
         id: release_notes
@@ -185,6 +225,133 @@ jobs:
               throw error;
             }
 
+      - name: Build Slack payload for draft release
+        id: slack_draft_payload
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
+          TAG_URL: ${{ steps.tag_info.outputs.tag_url }}
+          BRANCH: ${{ steps.tag_info.outputs.branch }}
+          BRANCH_URL: ${{ steps.tag_info.outputs.branch_url }}
+          COMPONENT: ${{ steps.tag_info.outputs.component }}
+          PREVIOUS_TAG: ${{ steps.previous_tag.outputs.previous_tag }}
+          PREVIOUS_TAG_URL: ${{ steps.previous_tag.outputs.previous_tag_url }}
+          RELEASE_URL: ${{ steps.create_release.outputs.release_url }}
+          SUCCESS: ${{ steps.create_release.outputs.success }}
+          IS_ANNOTATED: ${{ steps.tag_kind.outputs.is_annotated }}
+          ACTOR_LOGIN: ${{ steps.actor_info.outputs.login }}
+          ACTOR_URL: ${{ steps.actor_info.outputs.url }}
+          ACTOR_EMAIL: ${{ steps.actor_info.outputs.email }}
+        run: |
+          set -euo pipefail
+
+          export TAG_NAME TAG_URL BRANCH BRANCH_URL COMPONENT PREVIOUS_TAG PREVIOUS_TAG_URL RELEASE_URL SUCCESS IS_ANNOTATED ACTOR_LOGIN ACTOR_URL ACTOR_EMAIL
+
+          python3 - <<'PY' > /tmp/slack-payload.json
+          import json, os
+
+          tag_name = os.environ["TAG_NAME"]
+          tag_url = os.environ["TAG_URL"]
+          branch = os.environ["BRANCH"]
+          branch_url = os.environ.get("BRANCH_URL", "")
+          component = os.environ["COMPONENT"]
+          previous_tag = os.environ.get("PREVIOUS_TAG", "")
+          previous_tag_url = os.environ.get("PREVIOUS_TAG_URL", "")
+          release_url = os.environ.get("RELEASE_URL", "")
+          success = os.environ.get("SUCCESS", "")
+          is_annotated = os.environ.get("IS_ANNOTATED", "")
+          actor_login = os.environ.get("ACTOR_LOGIN", "")
+          actor_url = os.environ.get("ACTOR_URL", "")
+          actor_email = os.environ.get("ACTOR_EMAIL", "")
+
+          if success == "true":
+              icon = ":memo:"
+              title = "Draft release created"
+          else:
+              icon = ":warning:"
+              title = "Failed to create draft release"
+
+          if is_annotated != "true":
+              title = f"{title} · lightweight tag"
+
+          fields = [
+              {
+                  "type": "mrkdwn",
+                  "text": f"*Tag:*\n<{tag_url}|`{tag_name}`>"
+              },
+              {
+                  "type": "mrkdwn",
+                  "text": f"*Component:*\n`{component.upper()}`"
+              }
+          ]
+
+          if branch and branch != "unknown" and branch_url:
+              fields.append({
+                  "type": "mrkdwn",
+                  "text": f"*Branch:*\n<{branch_url}|`{branch}`>"
+              })
+
+          if previous_tag and previous_tag_url:
+              fields.append({
+                  "type": "mrkdwn",
+                  "text": f"*Previous tag:*\n<{previous_tag_url}|`{previous_tag}`>"
+              })
+
+          context_text = f"<{actor_url}|@{actor_login}>"
+          if actor_email:
+              context_text += f" (_`{actor_email}`_)"
+
+          blocks = [
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f"{icon} *{title}*"
+                  }
+              },
+              {
+                  "type": "section",
+                  "fields": fields
+              },
+              {
+                  "type": "context",
+                  "elements": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Author:* {context_text}"
+                      }
+                  ]
+              }
+          ]
+
+          if release_url:
+              blocks.append({
+                  "type": "actions",
+                  "elements": [
+                      {
+                          "type": "button",
+                          "text": {
+                              "type": "plain_text",
+                              "text": "View Draft Release"
+                          },
+                          "url": release_url
+                      }
+                  ]
+              })
+
+          print(json.dumps({
+              "username": "Release Bot",
+              "icon_emoji": ":rocket:",
+              "blocks": blocks
+          }))
+          PY
+
+          {
+            echo 'payload<<EOF'
+            cat /tmp/slack-payload.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Notify Slack about draft release
         id: slack_draft
         if: always() && steps.create_release.outcome != 'skipped'
@@ -192,11 +359,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
-          TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
-          COMPONENT: ${{ steps.tag_info.outputs.component }}
-          RELEASE_URL: ${{ steps.create_release.outputs.release_url }}
-          SUCCESS: ${{ steps.create_release.outputs.success }}
-          IS_ANNOTATED: ${{ steps.tag_kind.outputs.is_annotated }}
+          PAYLOAD: ${{ steps.slack_draft_payload.outputs.payload }}
         shell: bash
         run: |
           set -euo pipefail
@@ -206,60 +369,20 @@ jobs:
             exit 0
           fi
 
-          CHANNEL="${SLACK_CHANNEL:-#releases}"
-
-          if [[ "$SUCCESS" == "true" ]]; then
-            ICON=":memo:"
-            STATUS="Draft release created"
-          else
-            ICON=":warning:"
-            STATUS="Failed to create draft release"
-          fi
-
-          if [[ "$IS_ANNOTATED" != "true" ]]; then
-            ICON=":warning: :memo:"
-          fi
-
-          PAYLOAD="$(cat <<EOF
-          {
-            "channel": "$CHANNEL",
-            "username": "Release Bot",
-            "icon_emoji": ":rocket:",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "$ICON *$STATUS*\\n*Tag:* \`$TAG_NAME\`\\n*Component:* \`${COMPONENT^^}\`"
-                }
-              }
-            ]
-          }
-          EOF
-          )"
-
-          if [[ -n "${RELEASE_URL:-}" ]]; then
-            export PAYLOAD RELEASE_URL
-            PAYLOAD="$(python3 - <<'PY'
+          FINAL_PAYLOAD="$(python3 - <<'PY'
           import json, os
           payload = json.loads(os.environ["PAYLOAD"])
-          payload["blocks"].append({
-            "type": "actions",
-            "elements": [{
-              "type": "button",
-              "text": {"type": "plain_text", "text": "View Draft Release"},
-              "url": os.environ["RELEASE_URL"]
-            }]
-          })
+          channel = os.environ.get("SLACK_CHANNEL", "").strip()
+          if channel:
+              payload["channel"] = channel
           print(json.dumps(payload))
           PY
-            )"
-          fi
+          )"
 
           HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
             -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
-            -d "$PAYLOAD")"
+            -d "$FINAL_PAYLOAD")"
 
           if [[ "$HTTP_CODE" =~ ^2 ]]; then
             echo "slack_notified=true" >> "$GITHUB_OUTPUT"
@@ -274,16 +397,18 @@ jobs:
         shell: bash
         env:
           TAG_NAME: ${{ steps.tag_info.outputs.tag_name }}
+          TAG_URL: ${{ steps.tag_info.outputs.tag_url }}
           COMPONENT: ${{ steps.tag_info.outputs.component }}
           MAJOR_VERSION: ${{ steps.tag_info.outputs.major_version }}
           BRANCH: ${{ steps.tag_info.outputs.branch }}
+          BRANCH_URL: ${{ steps.tag_info.outputs.branch_url }}
           IS_ANNOTATED: ${{ steps.tag_kind.outputs.is_annotated }}
           PREVIOUS_TAG: ${{ steps.previous_tag.outputs.previous_tag }}
+          PREVIOUS_TAG_URL: ${{ steps.previous_tag.outputs.previous_tag_url }}
           RELEASE_SUCCESS: ${{ steps.create_release.outputs.success }}
           RELEASE_URL: ${{ steps.create_release.outputs.release_url }}
           RELEASE_ERROR: ${{ steps.create_release.outputs.error }}
           SLACK_RESULT: ${{ steps.slack_draft.outputs.slack_notified }}
-          HAS_SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
         run: |
           {
             echo "# Draft Release Summary"
@@ -291,15 +416,19 @@ jobs:
             echo "## Tag"
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| Tag | \`$TAG_NAME\` |"
+            echo "| Tag | [$TAG_NAME]($TAG_URL) |"
             echo "| Component | \`$COMPONENT\` |"
             echo "| Major | \`$MAJOR_VERSION\` |"
-            echo "| Branch | \`$BRANCH\` |"
+            if [[ "$BRANCH" != "unknown" && -n "$BRANCH_URL" ]]; then
+              echo "| Branch | [$BRANCH]($BRANCH_URL) |"
+            else
+              echo "| Branch | \`$BRANCH\` |"
+            fi
             echo "| Annotated | \`$IS_ANNOTATED\` |"
             echo
             echo "## Previous Tag"
-            if [[ -n "$PREVIOUS_TAG" ]]; then
-              echo "- \`$PREVIOUS_TAG\`"
+            if [[ -n "$PREVIOUS_TAG" && -n "$PREVIOUS_TAG_URL" ]]; then
+              echo "- [$PREVIOUS_TAG]($PREVIOUS_TAG_URL)"
             else
               echo "- none found"
             fi
@@ -316,11 +445,7 @@ jobs:
             fi
             echo
             echo "## Slack"
-            if [[ "$HAS_SLACK_WEBHOOK" != "true" ]]; then
-              echo "- skipped: no webhook configured"
-            else
-              echo "- result: \`${SLACK_RESULT:-unknown}\`"
-            fi
+            echo "- result: \`${SLACK_RESULT:-unknown}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   notify_release_published:
@@ -340,8 +465,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          TAG_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+
           echo "name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_url=$TAG_URL" >> "$GITHUB_OUTPUT"
           echo "url=$RELEASE_URL" >> "$GITHUB_OUTPUT"
           echo "prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
@@ -352,18 +480,140 @@ jobs:
             echo "component=unknown" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve release author info
+        id: release_author_info
+        uses: actions/github-script@v7
+        env:
+          LOGIN: ${{ steps.release_info.outputs.author }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const login = process.env.LOGIN;
+            let email = '';
+            let url = `${context.serverUrl}/${login}`;
+
+            try {
+              const { data } = await github.rest.users.getByUsername({ username: login });
+              url = data.html_url || url;
+              email = data.email || '';
+            } catch (_) {}
+
+            core.setOutput('login', login);
+            core.setOutput('url', url);
+            core.setOutput('email', email);
+
+      - name: Build Slack payload for published release
+        id: slack_release_payload
+        shell: bash
+        env:
+          RELEASE_NAME: ${{ steps.release_info.outputs.name }}
+          RELEASE_TAG: ${{ steps.release_info.outputs.tag }}
+          TAG_URL: ${{ steps.release_info.outputs.tag_url }}
+          RELEASE_URL: ${{ steps.release_info.outputs.url }}
+          COMPONENT: ${{ steps.release_info.outputs.component }}
+          IS_PRERELEASE: ${{ steps.release_info.outputs.prerelease }}
+          AUTHOR_LOGIN: ${{ steps.release_author_info.outputs.login }}
+          AUTHOR_URL: ${{ steps.release_author_info.outputs.url }}
+          AUTHOR_EMAIL: ${{ steps.release_author_info.outputs.email }}
+        run: |
+          set -euo pipefail
+
+          export RELEASE_NAME RELEASE_TAG TAG_URL RELEASE_URL COMPONENT IS_PRERELEASE AUTHOR_LOGIN AUTHOR_URL AUTHOR_EMAIL
+
+          python3 - <<'PY' > /tmp/slack-payload.json
+          import json, os
+
+          release_name = os.environ["RELEASE_NAME"]
+          release_tag = os.environ["RELEASE_TAG"]
+          tag_url = os.environ["TAG_URL"]
+          release_url = os.environ["RELEASE_URL"]
+          component = os.environ["COMPONENT"]
+          is_prerelease = os.environ["IS_PRERELEASE"]
+          author_login = os.environ["AUTHOR_LOGIN"]
+          author_url = os.environ["AUTHOR_URL"]
+          author_email = os.environ.get("AUTHOR_EMAIL", "")
+
+          icon = ":package:" if is_prerelease == "true" else ":rocket:"
+          kind = "Pre-release" if is_prerelease == "true" else "Release"
+
+          context_text = f"<{author_url}|@{author_login}>"
+          if author_email:
+              context_text += f" (_`{author_email}`_)"
+
+          blocks = [
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f"{icon} *{kind} published*"
+                  }
+              },
+              {
+                  "type": "section",
+                  "fields": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Name:*\n{release_name}"
+                      },
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Tag:*\n<{tag_url}|`{release_tag}`>"
+                      },
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Component:*\n`{component.upper()}`"
+                      },
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Release page:*\n<{release_url}|Open release>"
+                      }
+                  ]
+              },
+              {
+                  "type": "context",
+                  "elements": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Author:* {context_text}"
+                      }
+                  ]
+              },
+              {
+                  "type": "actions",
+                  "elements": [
+                      {
+                          "type": "button",
+                          "text": {
+                              "type": "plain_text",
+                              "text": "View Release"
+                          },
+                          "url": release_url,
+                          "style": "primary"
+                      }
+                  ]
+              }
+          ]
+
+          print(json.dumps({
+              "username": "Release Bot",
+              "icon_emoji": ":rocket:",
+              "blocks": blocks
+          }))
+          PY
+
+          {
+            echo 'payload<<EOF'
+            cat /tmp/slack-payload.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Notify Slack about published release
         id: slack_release
         continue-on-error: true
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
-          RELEASE_NAME: ${{ steps.release_info.outputs.name }}
-          RELEASE_TAG: ${{ steps.release_info.outputs.tag }}
-          RELEASE_URL: ${{ steps.release_info.outputs.url }}
-          COMPONENT: ${{ steps.release_info.outputs.component }}
-          IS_PRERELEASE: ${{ steps.release_info.outputs.prerelease }}
-          AUTHOR: ${{ steps.release_info.outputs.author }}
+          PAYLOAD: ${{ steps.slack_release_payload.outputs.payload }}
         shell: bash
         run: |
           set -euo pipefail
@@ -373,52 +623,20 @@ jobs:
             exit 0
           fi
 
-          CHANNEL="${SLACK_CHANNEL:-#releases}"
-
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            ICON=":package:"
-            KIND="Pre-release"
-          else
-            ICON=":rocket:"
-            KIND="Release"
-          fi
-
-          PAYLOAD="$(cat <<EOF
-          {
-            "channel": "$CHANNEL",
-            "username": "Release Bot",
-            "icon_emoji": ":rocket:",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "$ICON *$KIND Published*\\n*Name:* $RELEASE_NAME\\n*Tag:* \`$RELEASE_TAG\`\\n*Component:* \`${COMPONENT^^}\`\\n*Published by:* @$AUTHOR"
-                }
-              },
-              {
-                "type": "actions",
-                "elements": [
-                  {
-                    "type": "button",
-                    "text": {
-                      "type": "plain_text",
-                      "text": "View Release"
-                    },
-                    "url": "$RELEASE_URL",
-                    "style": "primary"
-                  }
-                ]
-              }
-            ]
-          }
-          EOF
+          FINAL_PAYLOAD="$(python3 - <<'PY'
+          import json, os
+          payload = json.loads(os.environ["PAYLOAD"])
+          channel = os.environ.get("SLACK_CHANNEL", "").strip()
+          if channel:
+              payload["channel"] = channel
+          print(json.dumps(payload))
+          PY
           )"
 
           HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
             -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
-            -d "$PAYLOAD")"
+            -d "$FINAL_PAYLOAD")"
 
           if [[ "$HTTP_CODE" =~ ^2 ]]; then
             echo "slack_notified=true" >> "$GITHUB_OUTPUT"
@@ -434,6 +652,7 @@ jobs:
         env:
           RELEASE_NAME: ${{ steps.release_info.outputs.name }}
           RELEASE_TAG: ${{ steps.release_info.outputs.tag }}
+          TAG_URL: ${{ steps.release_info.outputs.tag_url }}
           COMPONENT: ${{ steps.release_info.outputs.component }}
           IS_PRERELEASE: ${{ steps.release_info.outputs.prerelease }}
           AUTHOR: ${{ steps.release_info.outputs.author }}
@@ -446,7 +665,7 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Name | $RELEASE_NAME |"
-            echo "| Tag | \`$RELEASE_TAG\` |"
+            echo "| Tag | [$RELEASE_TAG]($TAG_URL) |"
             echo "| Component | \`$COMPONENT\` |"
             echo "| Type | \`$IS_PRERELEASE\` |"
             echo "| Author | @$AUTHOR |"
@@ -479,15 +698,22 @@ jobs:
               exit 0
             fi
 
+            BRANCH="${{ github.event.ref }}"
+            BRANCH_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${BRANCH}"
+
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "event_type=branch_created" >> "$GITHUB_OUTPUT"
-            echo "branch=${{ github.event.ref }}" >> "$GITHUB_OUTPUT"
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "branch_url=$BRANCH_URL" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           BRANCH="${GITHUB_REF#refs/heads/}"
+          BRANCH_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${BRANCH}"
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "branch_url=$BRANCH_URL" >> "$GITHUB_OUTPUT"
 
           if [[ "${{ github.event.forced }}" == "true" ]]; then
             echo "event_type=force_push" >> "$GITHUB_OUTPUT"
@@ -499,22 +725,196 @@ jobs:
         if: steps.detect_event.outputs.skip != 'true' && github.event_name == 'push'
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 50
 
-      - name: Get commit information
-        id: commit_info
+      - name: Resolve actor info
+        id: actor_info
+        if: steps.detect_event.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        env:
+          LOGIN: ${{ github.actor }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const login = process.env.LOGIN;
+            let email = '';
+            let url = `${context.serverUrl}/${login}`;
+
+            try {
+              const { data } = await github.rest.users.getByUsername({ username: login });
+              url = data.html_url || url;
+              email = data.email || '';
+            } catch (_) {}
+
+            core.setOutput('login', login);
+            core.setOutput('url', url);
+            core.setOutput('email', email);
+
+      - name: Collect push details
+        id: push_details
         if: steps.detect_event.outputs.skip != 'true' && github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commits = context.payload.commits || [];
+            const maxCommits = 10;
+            const selected = commits.slice(0, maxCommits);
+
+            function firstLine(s) {
+              return (s || '').split('\n')[0].trim();
+            }
+
+            function userLink(login) {
+              return `<${context.serverUrl}/${login}|@${login}>`;
+            }
+
+            const lines = [];
+            for (const c of selected) {
+              const sha = c.id;
+              const shortSha = sha.slice(0, 8);
+              const subject = firstLine(c.message) || shortSha;
+              const commitUrl = c.url?.replace('api.github.com/repos', 'github.com').replace('/commits/', '/commit/') || `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/commit/${sha}`;
+
+              let line = `• <${commitUrl}|${subject}> (\`${shortSha}\`)`;
+
+              try {
+                const prResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: sha
+                });
+
+                const prs = (prResp.data || []).filter(pr => pr);
+                const mergedPr = prs.find(pr => pr.merged_at) || prs[0];
+
+                if (mergedPr) {
+                  const prUrl = mergedPr.html_url;
+                  line += ` · PR <${prUrl}|#${mergedPr.number}>`;
+
+                  const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: mergedPr.number,
+                    per_page: 100
+                  });
+
+                  const reviewers = [];
+                  const seen = new Set();
+                  for (const review of reviews) {
+                    const login = review.user?.login;
+                    if (!login || seen.has(login)) continue;
+                    seen.add(login);
+                    reviewers.push(userLink(login));
+                  }
+
+                  if (reviewers.length > 0) {
+                    line += `\n  reviewers: ${reviewers.join(', ')}`;
+                  }
+                }
+              } catch (_) {
+              }
+
+              lines.push(line);
+            }
+
+            core.setOutput('commit_count', String(commits.length));
+            core.setOutput('commit_lines', lines.join('\n'));
+
+      - name: Build Slack payload for branch activity
+        id: slack_branch_payload
+        if: steps.detect_event.outputs.skip != 'true'
         shell: bash
+        env:
+          EVENT_TYPE: ${{ steps.detect_event.outputs.event_type }}
+          BRANCH: ${{ steps.detect_event.outputs.branch }}
+          BRANCH_URL: ${{ steps.detect_event.outputs.branch_url }}
+          ACTOR_LOGIN: ${{ steps.actor_info.outputs.login }}
+          ACTOR_URL: ${{ steps.actor_info.outputs.url }}
+          ACTOR_EMAIL: ${{ steps.actor_info.outputs.email }}
+          COMMIT_LINES: ${{ steps.push_details.outputs.commit_lines }}
+          COMMIT_COUNT: ${{ steps.push_details.outputs.commit_count }}
         run: |
           set -euo pipefail
 
-          COMMIT_SHA="${{ github.sha }}"
-          COMMIT_AUTHOR="$(git log -1 --pretty=%an "$COMMIT_SHA")"
-          COMMIT_URL="${{ github.server_url }}/${{ github.repository }}/commit/$COMMIT_SHA"
+          export EVENT_TYPE BRANCH BRANCH_URL ACTOR_LOGIN ACTOR_URL ACTOR_EMAIL COMMIT_LINES COMMIT_COUNT
 
-          echo "sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-          echo "author=$COMMIT_AUTHOR" >> "$GITHUB_OUTPUT"
-          echo "url=$COMMIT_URL" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' > /tmp/slack-payload.json
+          import json, os
+
+          event_type = os.environ["EVENT_TYPE"]
+          branch = os.environ["BRANCH"]
+          branch_url = os.environ["BRANCH_URL"]
+          actor_login = os.environ["ACTOR_LOGIN"]
+          actor_url = os.environ["ACTOR_URL"]
+          actor_email = os.environ.get("ACTOR_EMAIL", "")
+          commit_lines = os.environ.get("COMMIT_LINES", "").strip()
+          commit_count = os.environ.get("COMMIT_COUNT", "").strip()
+
+          if event_type == "branch_created":
+              icon = ":seedling:"
+              title = "Release branch created"
+          elif event_type == "force_push":
+              icon = ":warning:"
+              title = "Force push to release branch"
+          else:
+              icon = ":pushpin:"
+              title = "Push to release branch"
+
+          context_text = f"<{actor_url}|@{actor_login}>"
+          if actor_email:
+              context_text += f" (_`{actor_email}`_)"
+
+          blocks = [
+              {
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f"{icon} *{title}*"
+                  }
+              },
+              {
+                  "type": "section",
+                  "fields": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Branch:*\n<{branch_url}|`{branch}`>"
+                      }
+                  ]
+              },
+              {
+                  "type": "context",
+                  "elements": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"*Author:* {context_text}"
+                      }
+                  ]
+              }
+          ]
+
+          if commit_lines:
+              count_suffix = f" ({commit_count})" if commit_count else ""
+              blocks.append({
+                  "type": "section",
+                  "text": {
+                      "type": "mrkdwn",
+                      "text": f"*Commits pushed{count_suffix}*\n{commit_lines}"
+                  }
+              })
+
+          print(json.dumps({
+              "username": "Release Bot",
+              "icon_emoji": ":branch:",
+              "blocks": blocks
+          }))
+          PY
+
+          {
+            echo 'payload<<EOF'
+            cat /tmp/slack-payload.json
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
       - name: Notify Slack about branch activity
         id: slack_branch
@@ -523,12 +923,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_CHANNEL: ${{ vars.SLACK_RELEASE_CHANNEL }}
-          EVENT_TYPE: ${{ steps.detect_event.outputs.event_type }}
-          BRANCH: ${{ steps.detect_event.outputs.branch }}
-          COMMIT_SHA: ${{ steps.commit_info.outputs.sha }}
-          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
-          COMMIT_URL: ${{ steps.commit_info.outputs.url }}
-          ACTOR: ${{ github.actor }}
+          PAYLOAD: ${{ steps.slack_branch_payload.outputs.payload }}
         shell: bash
         run: |
           set -euo pipefail
@@ -538,69 +933,20 @@ jobs:
             exit 0
           fi
 
-          CHANNEL="${SLACK_CHANNEL:-#releases}"
-
-          case "$EVENT_TYPE" in
-            branch_created)
-              ICON=":seedling:"
-              TITLE="Release branch created"
-              BODY="Branch \`$BRANCH\` was created by @$ACTOR"
-              ;;
-            force_push)
-              ICON=":warning:"
-              TITLE="Force push to release branch"
-              BODY=":warning: \`$BRANCH\` was force-pushed by @$ACTOR"
-              ;;
-            push)
-              ICON=":pushpin:"
-              TITLE="Push to release branch"
-              BODY="Branch \`$BRANCH\` received a push from @$ACTOR"
-              ;;
-            *)
-              echo "slack_notified=skipped" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          PAYLOAD="$(cat <<EOF
-          {
-            "channel": "$CHANNEL",
-            "username": "Release Bot",
-            "icon_emoji": ":branch:",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "$ICON *$TITLE*\\n$BODY"
-                }
-              }
-            ]
-          }
-          EOF
-          )"
-
-          if [[ -n "${COMMIT_URL:-}" ]]; then
-            export PAYLOAD COMMIT_URL COMMIT_SHA COMMIT_AUTHOR
-            PAYLOAD="$(python3 - <<'PY'
+          FINAL_PAYLOAD="$(python3 - <<'PY'
           import json, os
           payload = json.loads(os.environ["PAYLOAD"])
-          payload["blocks"].append({
-            "type": "section",
-            "text": {
-              "type": "mrkdwn",
-              "text": f"*Commit:* <{os.environ['COMMIT_URL']}|`{os.environ['COMMIT_SHA'][:8]}`> by {os.environ['COMMIT_AUTHOR']}"
-            }
-          })
+          channel = os.environ.get("SLACK_CHANNEL", "").strip()
+          if channel:
+              payload["channel"] = channel
           print(json.dumps(payload))
           PY
-            )"
-          fi
+          )"
 
           HTTP_CODE="$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
             -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
-            -d "$PAYLOAD")"
+            -d "$FINAL_PAYLOAD")"
 
           if [[ "$HTTP_CODE" =~ ^2 ]]; then
             echo "slack_notified=true" >> "$GITHUB_OUTPUT"
@@ -616,9 +962,11 @@ jobs:
         env:
           EVENT_TYPE: ${{ steps.detect_event.outputs.event_type }}
           BRANCH: ${{ steps.detect_event.outputs.branch }}
+          BRANCH_URL: ${{ steps.detect_event.outputs.branch_url }}
           ACTOR: ${{ github.actor }}
-          COMMIT_SHA: ${{ steps.commit_info.outputs.sha }}
-          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          COMMIT_LINES: ${{ steps.push_details.outputs.commit_lines }}
           SLACK_RESULT: ${{ steps.slack_branch.outputs.slack_notified }}
         run: |
           {
@@ -627,12 +975,16 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Event | \`$EVENT_TYPE\` |"
-            echo "| Branch | \`$BRANCH\` |"
+            echo "| Branch | [$BRANCH]($BRANCH_URL) |"
             echo "| Actor | @$ACTOR |"
-            if [[ -n "$COMMIT_SHA" ]]; then
-              echo "| Commit | \`$COMMIT_SHA\` |"
-              echo "| Author | $COMMIT_AUTHOR |"
+            if [[ "$EVENT_TYPE" != "branch_created" ]]; then
+              echo "| Commit | [\`${COMMIT_SHA:0:8}\`]($COMMIT_URL) |"
             fi
             echo
+            if [[ -n "$COMMIT_LINES" ]]; then
+              echo "## Commits"
+              echo "$COMMIT_LINES"
+              echo
+            fi
             echo "- slack: \`${SLACK_RESULT:-unknown}\`"
           } >> "$GITHUB_STEP_SUMMARY"
