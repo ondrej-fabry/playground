@@ -1,0 +1,31 @@
+name: Validate release tag
+
+on:
+  push:
+    tags:
+      - 'release/**'
+
+jobs:
+  validate-release-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure release tag is annotated
+        run: |
+          tag="${GITHUB_REF_NAME}"
+
+          git fetch --tags --force
+
+          type="$(git cat-file -t "refs/tags/$tag")"
+
+          if [ "$type" != "tag" ]; then
+            echo "::error::Release tag '$tag' is lightweight. Use an annotated tag instead:"
+            echo "git tag -a '$tag' -m '$tag'"
+            echo "git push origin '$tag'"
+            exit 1
+          fi
+
+          echo "Release tag '$tag' is annotated."
