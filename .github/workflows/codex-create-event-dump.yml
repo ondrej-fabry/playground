@@ -1,9 +1,10 @@
 name: Codex create-event dump
 
-run-name: "Created ${{ github.event.ref_type }}: ${{ github.event.ref }}"
+run-name: "${{ github.event_name == 'create' && 'Created' || 'Deleted' }} ${{ github.event.ref_type }}: ${{ github.event.ref }}"
 
 on:
   create:
+  delete:
 
 permissions: {}
 
