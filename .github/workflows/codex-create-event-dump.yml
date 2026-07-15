@@ -1,0 +1,13 @@
+name: Codex create-event dump
+
+on:
+  create:
+
+permissions: {}
+
+jobs:
+  dump-event:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print event payload
+        run: jq . "$GITHUB_EVENT_PATH"
