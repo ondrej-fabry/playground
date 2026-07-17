@@ -1,0 +1,51 @@
+name: Dummy Workflow Run Listener
+
+run-name: "Listener for run #${{ github.event.workflow_run.run_number }} (${{ github.event.workflow_run.event }}) - ${{ github.event.action }}"
+
+on:
+  workflow_run:
+    workflows: ["Dummy PR Trigger"]
+    types: [requested, in_progress]
+
+permissions: {}
+
+jobs:
+  dump-info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print verbose event info
+        run: |
+          {
+            echo "### Dummy Workflow Run Listener - Verbose Info"
+            echo
+            echo "| Key | Value |"
+            echo "|-----|-------|"
+            echo "| event_name | \`${{ github.event_name }}\` |"
+            echo "| action | \`${{ github.event.action }}\` |"
+            echo "| workflow (this) | \`${{ github.workflow }}\` |"
+            echo "| run_id (this) | \`${{ github.run_id }}\` |"
+            echo "| run_number (this) | \`${{ github.run_number }}\` |"
+            echo "| run_attempt (this) | \`${{ github.run_attempt }}\` |"
+            echo "| --- caller workflow_run --- | --- |"
+            echo "| caller workflow name | \`${{ github.event.workflow_run.name }}\` |"
+            echo "| caller run_id | \`${{ github.event.workflow_run.id }}\` |"
+            echo "| caller run_number | \`${{ github.event.workflow_run.run_number }}\` |"
+            echo "| caller run_attempt | \`${{ github.event.workflow_run.run_attempt }}\` |"
+            echo "| caller event | \`${{ github.event.workflow_run.event }}\` |"
+            echo "| caller status | \`${{ github.event.workflow_run.status }}\` |"
+            echo "| caller conclusion | \`${{ github.event.workflow_run.conclusion }}\` |"
+            echo "| caller head_branch | \`${{ github.event.workflow_run.head_branch }}\` |"
+            echo "| caller head_sha | \`${{ github.event.workflow_run.head_sha }}\` |"
+            echo "| caller actor | \`${{ github.event.workflow_run.actor.login }}\` |"
+            echo "| caller triggering_actor | \`${{ github.event.workflow_run.triggering_actor.login }}\` |"
+            echo "| caller run_started_at | \`${{ github.event.workflow_run.run_started_at }}\` |"
+            echo "| caller html_url | \`${{ github.event.workflow_run.html_url }}\` |"
+            echo "| repository | \`${{ github.repository }}\` |"
+            echo "| event_path | \`$GITHUB_EVENT_PATH\` |"
+            echo
+            echo "#### Full event payload"
+            echo
+            echo '```json'
+            jq . "$GITHUB_EVENT_PATH"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

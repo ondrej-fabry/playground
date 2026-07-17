@@ -1,0 +1,12 @@
+name: Dummy Manual Dispatch
+
+run-name: "Dummy manual dispatch - triggered by ${{ github.actor }}"
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  call-dummy-pr-trigger:
+    uses: ./.github/workflows/dummy-pr-trigger.yml

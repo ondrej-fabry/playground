@@ -1,0 +1,47 @@
+name: Dummy PR Trigger
+
+run-name: "Dummy PR trigger (#${{ github.event.pull_request.number }}) - ${{ github.event.action }}"
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  dump-info:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print verbose event info
+        run: |
+          {
+            echo "### Dummy PR Trigger - Verbose Info"
+            echo
+            echo "| Key | Value |"
+            echo "|-----|-------|"
+            echo "| event_name | \`${{ github.event_name }}\` |"
+            echo "| action | \`${{ github.event.action }}\` |"
+            echo "| workflow | \`${{ github.workflow }}\` |"
+            echo "| run_id | \`${{ github.run_id }}\` |"
+            echo "| run_number | \`${{ github.run_number }}\` |"
+            echo "| run_attempt | \`${{ github.run_attempt }}\` |"
+            echo "| job | \`${{ github.job }}\` |"
+            echo "| ref | \`${{ github.ref }}\` |"
+            echo "| ref_name | \`${{ github.ref_name }}\` |"
+            echo "| sha | \`${{ github.sha }}\` |"
+            echo "| actor | \`${{ github.actor }}\` |"
+            echo "| triggering_actor | \`${{ github.triggering_actor }}\` |"
+            echo "| repository | \`${{ github.repository }}\` |"
+            echo "| pr_number | \`${{ github.event.pull_request.number }}\` |"
+            echo "| pr_head_sha | \`${{ github.event.pull_request.head.sha }}\` |"
+            echo "| pr_head_ref | \`${{ github.event.pull_request.head.ref }}\` |"
+            echo "| pr_base_ref | \`${{ github.event.pull_request.base.ref }}\` |"
+            echo "| event_path | \`$GITHUB_EVENT_PATH\` |"
+            echo
+            echo "#### Full event payload"
+            echo
+            echo '```json'
+            jq . "$GITHUB_EVENT_PATH"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
